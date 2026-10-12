@@ -1,5 +1,8 @@
 ## Interface: 30300
-## Author: Starfox
+## Author: Starfox, Fiftybengt, Claude
+## Version: 1.0.36
+## Notes: Shows raid lockouts, daily heroic, weekly raid, WG and PvP daily status of all your characters
+## X-Credits: Starfox (original author), Fiftybengt (3.3.5 maintenance), Claude by Anthropic (bug fixes and performance improvements)
 ## Title: Ailo
 ## SavedVariables: AiloDB
 ## OptionalDeps: Ace3, LibDBIcon-1.0, LibQTip-1.0, !ClassColors
