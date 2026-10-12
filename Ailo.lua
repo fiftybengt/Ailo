@@ -1,5 +1,6 @@
 ﻿-- locals, helperfunctions
-local string_gsub, string_format, strfind, tsort, tinsert = string.gsub, string.format, strfind, table.sort, table.insert
+local string_gsub, string_format, tsort, tinsert = string.gsub, string.format, table.sort, table.insert
+local pairs, ipairs, next, type, select, time = pairs, ipairs, next, type, select, time
 local wipe = wipe
 
 -- LibDataBroker
@@ -11,16 +12,25 @@ local L = LibStub("AceLocale-3.0"):GetLocale("Ailo", false)
 local DB_VERSION = 3
 local currentChar, currentRealm, currentCharRealm, currentMaxLevel
 
--- Sorting
+local ONE_WEEK = 7 * 24 * 60 * 60
+local QUEST_QUERY_THROTTLE = 60 -- seconds between automatic QueryQuestsCompleted() calls
+local lastQuestQuery = 0
+
+-- Sorting (tables are reused between tooltip builds to avoid garbage)
 local sortRealms = {}
 local sortRealmsPlayer = {}
+local sortRaids = {}
+local sortSizes = {}
+local sortDifficulties = {}
+local raidorder = {}
 
 local function setColor(info, r, g, b, a)
     Ailo.db.profile[info[#info]] = { r = r, g = g, b = b, a = a }
 end
 
 local function getColor(info)
-    return Ailo.db.profile[info[#info]].r, Ailo.db.profile[info[#info]].g, Ailo.db.profile[info[#info]].b, Ailo.db.profile[info[#info]].a
+    local c = Ailo.db.profile[info[#info]]
+    return c.r, c.g, c.b, c.a
 end
 
 local defaults = {
@@ -46,12 +56,13 @@ local defaults = {
             minimapPos = 220,
             radius = 80,
         },
-        
+
     },
     global = {
         chars = {},
         charClass = {},
         raids = {},
+        weeklyReset = {}, -- [realm] = timestamp of the next known weekly reset
         nextPurge = 0,
         version = 0,
     },
@@ -65,66 +76,100 @@ function Ailo:OnInitialize()
     currentRealm = GetRealmName()
     currentCharRealm = currentChar..' - '..currentRealm
 
-    if currentMaxLevel == UnitLevel("player") then 
-        self:RegisterEvent("CHAT_MSG_SYSTEM")
-        self:RegisterEvent("UPDATE_INSTANCE_INFO")
-        self:RegisterEvent("LFG_COMPLETION_REWARD")
-        self:RegisterEvent("LFG_UPDATE_RANDOM_INFO")
-        self:RegisterEvent("QUEST_QUERY_COMPLETE")
-    end
-    
-    
     self.db = LibStub("AceDB-3.0"):New("AiloDB", defaults, true)
+    self.db.RegisterCallback(self, "OnProfileChanged", "OnProfileChanged")
+    self.db.RegisterCallback(self, "OnProfileCopied", "OnProfileChanged")
+    self.db.RegisterCallback(self, "OnProfileReset", "OnProfileChanged")
     LibStub("AceConfig-3.0"):RegisterOptionsTable("Ailo", self.GenerateOptions)
 
     if not self.db.global.version or DB_VERSION > self.db.global.version then
         self:Output(L["DB_VERSION_UPGRADE_PURGE"])
         Ailo:WipeDB()
-        self.db.global.version = DB_VERSION 
+        self.db.global.version = DB_VERSION
     end
 
     local AiloLDB = ldb:NewDataObject("Ailo", {
         type = "data source",
         text = "Ailo",
-        icon = "Interface\\Icons\\Achievement_Dungeon_UlduarRaid_Archway_01.png",
+        icon = "Interface\\Icons\\Achievement_Dungeon_UlduarRaid_Archway_01",
         OnClick = function(clickedframe, button)
-            if button == "RightButton" then 
-                InterfaceOptionsFrame_OpenToCategory(Ailo.optionsFrame) 
-            else 
+            if button == "RightButton" then
+                -- Called twice: the first call on 3.3.5 often only opens the
+                -- options window without selecting the category
+                InterfaceOptionsFrame_OpenToCategory(Ailo.optionsFrame)
+                InterfaceOptionsFrame_OpenToCategory(Ailo.optionsFrame)
+            else
                 if IsShiftKeyDown() then
-                    Ailo:ManualPlayerUpdate() 
+                    Ailo:ManualPlayerUpdate()
                 else
                     ToggleFriendsFrame(5)
                 end
             end
         end,
         OnEnter = function(tt)
-            local tooltip = LibQTip:Acquire("AiloTooltip", 1, "LEFT") 
+            if Ailo.tooltip then
+                LibQTip:Release(Ailo.tooltip)
+            end
+            local tooltip = LibQTip:Acquire("AiloTooltip", 1, "LEFT")
             Ailo.tooltip = tooltip
-            Ailo:PrepareTooltip(tooltip) 
+            Ailo:PrepareTooltip(tooltip)
             tooltip:SmartAnchorTo(tt)
             tooltip:Show()
         end,
         OnLeave = function(tt)
-            LibQTip:Release(Ailo.tooltip)
-            Ailo.tooltip = nil
+            if Ailo.tooltip then
+                LibQTip:Release(Ailo.tooltip)
+                Ailo.tooltip = nil
+            end
         end,
     })
 
     LDBIcon:Register("Ailo", AiloLDB, self.db.profile.minimapIcon)
-    -- Request saved raidID's for this char
-    -- Will trigger UPDATE_INSTANCE_INFO when after the data is recieved
-    RequestRaidInfo()
     self:SetupClasscoloredFonts()
     if CUSTOM_CLASS_COLORS then
         CUSTOM_CLASS_COLORS:RegisterCallback("SetupClasscoloredFonts", self)
     end
 end
 
+function Ailo:OnEnable()
+    -- Drop anything that expired while we were logged out
+    self:PurgeExpired()
+
+    if UnitLevel("player") >= currentMaxLevel then
+        self:RegisterTrackingEvents()
+    else
+        self:RegisterEvent("PLAYER_LEVEL_UP")
+    end
+end
+
+function Ailo:RegisterTrackingEvents()
+    self:RegisterEvent("CHAT_MSG_SYSTEM")
+    self:RegisterEvent("UPDATE_INSTANCE_INFO")
+    self:RegisterEvent("LFG_COMPLETION_REWARD")
+    self:RegisterEvent("LFG_UPDATE_RANDOM_INFO")
+    self:RegisterEvent("QUEST_QUERY_COMPLETE")
+    self:RegisterEvent("PLAYER_ENTERING_WORLD")
+    -- Request saved raidID's for this char
+    -- Will trigger UPDATE_INSTANCE_INFO when after the data is recieved
+    RequestRaidInfo()
+end
+
+function Ailo:PLAYER_LEVEL_UP(event, level)
+    if level and level >= currentMaxLevel then
+        self:UnregisterEvent("PLAYER_LEVEL_UP")
+        self:RegisterTrackingEvents()
+    end
+end
+
+function Ailo:OnProfileChanged()
+    self:SetupClasscoloredFonts()
+    LDBIcon:Refresh("Ailo", self.db.profile.minimapIcon)
+end
+
 local RAID_CLASS_COLORS_FONTS = {}
 
 function Ailo:SetupClasscoloredFonts()
-    local class, color, CHOOSEN_CLASS_COLORS
+    local CHOOSEN_CLASS_COLORS
 
     if self.db.profile.useCustomClassColors and CUSTOM_CLASS_COLORS then
         CHOOSEN_CLASS_COLORS = CUSTOM_CLASS_COLORS
@@ -132,11 +177,14 @@ function Ailo:SetupClasscoloredFonts()
         CHOOSEN_CLASS_COLORS = RAID_CLASS_COLORS
     end
     for class,color in pairs(CHOOSEN_CLASS_COLORS) do
-        if not RAID_CLASS_COLORS_FONTS[class] then 
-            RAID_CLASS_COLORS_FONTS[class] = CreateFont("ClassFont"..class)
-            RAID_CLASS_COLORS_FONTS[class]:CopyFontObject(GameTooltipText)
+        -- CUSTOM_CLASS_COLORS also contains its API functions
+        if type(color) == "table" and color.r then
+            if not RAID_CLASS_COLORS_FONTS[class] then
+                RAID_CLASS_COLORS_FONTS[class] = CreateFont("AiloClassFont"..class)
+                RAID_CLASS_COLORS_FONTS[class]:CopyFontObject(GameTooltipText)
+            end
+            RAID_CLASS_COLORS_FONTS[class]:SetTextColor(color.r, color.g, color.b)
         end
-        RAID_CLASS_COLORS_FONTS[class]:SetTextColor(color.r, color.g, color.b)
     end
 end
 
@@ -181,8 +229,8 @@ function Ailo:GenerateOptions()
                         name = L["Use !ClassColors"],
                         desc = L["Use !ClassColors addon for class colors used to color the names in the tooltip"],
                         get = function(info) return Ailo.db.profile[info[#info]] end,
-                        set = function(info, value) 
-                            Ailo.db.profile[info[#info]] = value 
+                        set = function(info, value)
+                            Ailo.db.profile[info[#info]] = value
                             Ailo:SetupClasscoloredFonts()
                         end,
                         disabled = function() return not Ailo.db.profile.useClassColors or not CUSTOM_CLASS_COLORS end,
@@ -248,13 +296,13 @@ function Ailo:GenerateOptions()
                         order = -4,
                         name = L["Show Realm Headers"],
                         desc = L["SHOW_REALMLINES_DESC"],
-                    },                    
+                    },
                     showAllChars  = {
                         type = "toggle",
                         order = -3,
                         name = L["Show all chars"],
                         desc = L["Regardles of any saved instances"],
-                    },                    
+                    },
 
                     wipeDB = {
                         type = "execute",
@@ -270,7 +318,7 @@ function Ailo:GenerateOptions()
                     },
                 },
             },
-            instanceAbbr = { 
+            instanceAbbr = {
                 type = 'group',
                 name = L["Instance Abbreviations"],
                 get = function(info) return Ailo.db.profile.instanceAbbr[info[#info]] end,
@@ -285,8 +333,7 @@ function Ailo:GenerateOptions()
             },
         },
     }
-    local instance, abbr
-    for instance, abbr in pairs(Ailo.db.profile.instanceAbbr) do
+    for instance in pairs(Ailo.db.profile.instanceAbbr) do
         Ailo.options.args.instanceAbbr.args[instance] = {
             type = "input",
             name = instance,
@@ -300,10 +347,18 @@ function Ailo:Output(...)
     if self.db.profile.showMessages then
         Ailo:Print(...)
     end
-end 
+end
+
+local function sortedKeys(t, out)
+    wipe(out)
+    for k in pairs(t) do
+        tinsert(out, k)
+    end
+    tsort(out)
+    return out
+end
 
 function Ailo:PrepareTooltip(tooltip)
-    local raidorder = {}
     --[[[ Cell are just colored green/red
                ToC       VoA
             10     25   10  25
@@ -312,77 +367,80 @@ function Ailo:PrepareTooltip(tooltip)
     Char2 [] [ ] [] [ ] [ ] [ ]
     Char3 [] [ ] [] [ ] [ ] [ ]
     ]]--
+    local profile = self.db.profile
     local charsdb = self.db.global.chars
     local raidsdb = self.db.global.raids
-    
+
     local nextPurge = self.db.global.nextPurge
     if nextPurge > 0 and time() > nextPurge then
-        -- Only search 
-        self:PurgeOldRaidIDs()
-        self:TrimRaidTable()
-        self:CheckDailyHeroicLockouts()
-        self.db.global.nextPurge = self:GetNextPurge()
+        self:PurgeExpired()
     end
 
-    if next(raidsdb) or self.db.profile.showAllChars or 
-       self.db.profile.showDailyHeroic or self.db.profile.showWeeklyRaid or 
-       self.db.profile.showWGVictory or self.db.profile.showDailyPVP then
-        -- At least one char is saved to some 
+    wipe(raidorder)
+
+    if next(raidsdb) or profile.showAllChars or
+       profile.showDailyHeroic or profile.showWeeklyRaid or
+       profile.showWGVictory or profile.showDailyPVP then
+        -- At least one char is saved to some
         tooltip:AddHeader(L["Raid"]) -- Raid
         tooltip:AddHeader(L["Size"]) -- Size
         tooltip:AddHeader(L["Diff"]) -- Heroic
 
-        local raid, size, difficulties,  difficulty, colcount, numdifficulties, lastcolumn, dailyHeroicColum, weeklyRaidColumn, wgVictoryColumn, dailyPVPColumn
+        local colcount, numdifficulties, lastcolumn, dailyHeroicColum, weeklyRaidColumn, wgVictoryColumn, dailyPVPColumn
         -- Daily Heroic column
-        if self.db.profile.showDailyHeroic then
+        if profile.showDailyHeroic then
             dailyHeroicColum = tooltip:AddColumn("CENTER")
             tooltip:SetCell(1, dailyHeroicColum, "2")
             tooltip:SetCell(2, dailyHeroicColum, "x")
             tooltip:SetCell(3, dailyHeroicColum, "|TInterface\\Icons\\inv_misc_frostemblem_01:0|t")
         end
         -- Weekly Raid column
-        if self.db.profile.showWeeklyRaid then
+        if profile.showWeeklyRaid then
             weeklyRaidColumn = tooltip:AddColumn("CENTER")
             tooltip:SetCell(1, weeklyRaidColumn, "5")
             tooltip:SetCell(2, weeklyRaidColumn, "x")
             tooltip:SetCell(3, weeklyRaidColumn, "|TInterface\\Icons\\inv_misc_frostemblem_01:0|t")
         end
-        
+
         -- PvP Daily column
-        if self.db.profile.showDailyPVP then
+        if profile.showDailyPVP then
             dailyPVPColumn = tooltip:AddColumn("CENTER")
             tooltip:SetCell(1, dailyPVPColumn, "25")
             tooltip:SetCell(2, dailyPVPColumn, "x")
             tooltip:SetCell(3, dailyPVPColumn, "|TInterface\\PVPFrame\\PVP-ArenaPoints-Icon:0|t")
         end
         -- Wintergrasp Victory column
-        if self.db.profile.showWGVictory then
+        if profile.showWGVictory then
             wgVictoryColumn = tooltip:AddColumn("CENTER")
             tooltip:SetCell(1, wgVictoryColumn, "10")
             tooltip:SetCell(2, wgVictoryColumn, "x")
             tooltip:SetCell(3, wgVictoryColumn, "|TInterface\\Icons\\inv_misc_platnumdisks:0|t")
         end
-        
-        -- Instances with lockouts
-        local raidabbr
-        for raid, sizes in pairs(raidsdb) do
+
+        -- Instances with lockouts, sorted so the column order is stable
+        local raidabbr, sizes, difficulties
+        for _, raid in ipairs(sortedKeys(raidsdb, sortRaids)) do
             colcount = 0 -- Span needed for the 'Raid' cell above the 'Size' cells
             raidabbr = self:GetInstanceAbbr(raid)
             if raidabbr then
-                for size, difficulties in pairs(sizes) do
+                sizes = raidsdb[raid]
+                for _, size in ipairs(sortedKeys(sizes, sortSizes)) do
                     numdifficulties = 0 -- Span needed for the 'Size' cell above the 'Difficulty' cells
-    
-                    if size > 5 or self.db.profile.show5Man then
-                        for difficulty, _ in pairs(difficulties) do
+
+                    if size > 5 or profile.show5Man then
+                        difficulties = sizes[size]
+                        for _, difficulty in ipairs(sortedKeys(difficulties, sortDifficulties)) do
                             colcount = colcount +1
                             numdifficulties = numdifficulties +1
-            
+
                             lastcolumn = tooltip:AddColumn("CENTER")
-                            tooltip:SetCell(3, lastcolumn, (difficulty > 2 or size==5) and self.db.profile.hc or self.db.profile.nhc)
-        
+                            tooltip:SetCell(3, lastcolumn, (difficulty > 2 or size==5) and profile.hc or profile.nhc)
+
                             raidorder[(string_format("%s.%d.%s", raid, size, difficulty))] = lastcolumn
                         end
-                        tooltip:SetCell(2, lastcolumn - numdifficulties+1, size, numdifficulties)
+                        if numdifficulties > 0 then
+                            tooltip:SetCell(2, lastcolumn - numdifficulties+1, size, numdifficulties)
+                        end
                     end
                 end
                 if colcount > 0 then
@@ -391,50 +449,56 @@ function Ailo:PrepareTooltip(tooltip)
             end
         end
         self:BuildSortedKeyTables()
-        local iterateRealm, iteratePlayer, nameString, instances, currentInstance, lastline, realmSepPosition, displayedName
+
+        local saved, free = profile.savedraid, profile.freeraid
+        local sr, sg, sb, sa = saved.r, saved.g, saved.b, saved.a
+        local fr, fg, fb, fa = free.r, free.g, free.b, free.a
+        local numColumns = tooltip:GetColumnCount()
+        local charClass = self.db.global.charClass
+        local instances, lastline, nameString
+
         for _,iterateRealm in ipairs(sortRealms) do
-            if self.db.profile.showRealmHeaderLines then
+            if profile.showRealmHeaderLines then
                 lastline = tooltip:AddLine("")
-                tooltip:SetCell(lastline, 1, iterateRealm, nil, "CENTER", tooltip:GetColumnCount())
+                tooltip:SetCell(lastline, 1, iterateRealm, nil, "CENTER", numColumns)
             end
             for _,iteratePlayer in ipairs(sortRealmsPlayer[iterateRealm]) do
                 instances = charsdb[iterateRealm][iteratePlayer]
-                if self.db.profile.showAllChars or (instances.lockouts and next(instances.lockouts)) or 
+                if profile.showAllChars or (instances.lockouts and next(instances.lockouts)) or
                    instances.dailyheroic or instances.weeklydone or instances.wgvictory or instances.dailypvp then
                     lastline = tooltip:AddLine("")
-                    if self.db.profile.showCharacterRealm then
+                    if profile.showCharacterRealm then
                       nameString = iteratePlayer.." - "..iterateRealm
                     else
                       nameString = iteratePlayer
                     end
 
-                    if self.db.profile.useClassColors then
-                        tooltip:SetCell(lastline, 1, nameString, RAID_CLASS_COLORS_FONTS[self.db.global.charClass[iteratePlayer.." - "..iterateRealm]])
+                    if profile.useClassColors then
+                        tooltip:SetCell(lastline, 1, nameString, RAID_CLASS_COLORS_FONTS[charClass[iteratePlayer.." - "..iterateRealm]])
                     else
                         tooltip:SetCell(lastline, 1, nameString )
                     end
-        
-                    for i = tooltip:GetColumnCount(),2,-1 do
+
+                    for i = numColumns,2,-1 do
                         tooltip:SetCell(lastline, i, "")
-                        tooltip:SetCellColor(lastline, i, self.db.profile.freeraid.r, self.db.profile.freeraid.g, self.db.profile.freeraid.b, self.db.profile.freeraid.a)
+                        tooltip:SetCellColor(lastline, i, fr, fg, fb, fa)
                     end
                     if dailyHeroicColum and instances.dailyheroic then
-                        tooltip:SetCellColor(lastline, dailyHeroicColum, self.db.profile.savedraid.r, self.db.profile.savedraid.g, self.db.profile.savedraid.b, self.db.profile.savedraid.a)
+                        tooltip:SetCellColor(lastline, dailyHeroicColum, sr, sg, sb, sa)
                     end
                     if weeklyRaidColumn and instances.weeklydone then
-                        tooltip:SetCellColor(lastline, weeklyRaidColumn, self.db.profile.savedraid.r, self.db.profile.savedraid.g, self.db.profile.savedraid.b, self.db.profile.savedraid.a)
-                    
+                        tooltip:SetCellColor(lastline, weeklyRaidColumn, sr, sg, sb, sa)
                     end
-                    if dailyPVPColumn and instances.dailpvp then
-                        tooltip:SetCellColor(lastline, dailyPVPColumn, self.db.profile.savedraid.r, self.db.profile.savedraid.g, self.db.profile.savedraid.b, self.db.profile.savedraid.a)
+                    if dailyPVPColumn and instances.dailypvp then
+                        tooltip:SetCellColor(lastline, dailyPVPColumn, sr, sg, sb, sa)
                     end
                     if wgVictoryColumn and instances.wgvictory then
-                        tooltip:SetCellColor(lastline, wgVictoryColumn, self.db.profile.savedraid.r, self.db.profile.savedraid.g, self.db.profile.savedraid.b, self.db.profile.savedraid.a)
+                        tooltip:SetCellColor(lastline, wgVictoryColumn, sr, sg, sb, sa)
                     end
                     if instances.lockouts then
-                        for currentInstance, _ in pairs(instances.lockouts) do
+                        for currentInstance in pairs(instances.lockouts) do
                             if raidorder[currentInstance] then
-                                tooltip:SetCellColor(lastline, raidorder[currentInstance], self.db.profile.savedraid.r, self.db.profile.savedraid.g, self.db.profile.savedraid.b, self.db.profile.savedraid.a)
+                                tooltip:SetCellColor(lastline, raidorder[currentInstance], sr, sg, sb, sa)
                             end
                         end
                     end
@@ -446,39 +510,36 @@ function Ailo:PrepareTooltip(tooltip)
         tooltip:AddHeader(L["No saved raids found"])
     end
 end
+
 function Ailo:BuildSortedKeyTables()
-    local c, r
     wipe(sortRealms)
-    sortRealms = {}
-    wipe(sortRealmsPlayer)
-    sortRealmsPlayer = {}
-    for r,_ in pairs(self.db.global.chars) do
+    for r, chars in pairs(self.db.global.chars) do
         tinsert(sortRealms, r)
-        sortRealmsPlayer[r] = {}
-        for c,_ in pairs(self.db.global.chars[r]) do
-            tinsert(sortRealmsPlayer[r],c)
-        end
-        tsort(sortRealmsPlayer[r])
+        sortRealmsPlayer[r] = sortedKeys(chars, sortRealmsPlayer[r] or {})
     end
     tsort(sortRealms)
 end
 
 function Ailo:GetInstanceAbbr(instanceName)
-    if not self.db.profile.instanceAbbr[instanceName] then
+    local instanceAbbr = self.db.profile.instanceAbbr
+    if not instanceAbbr[instanceName] then
         -- Has no abbreviation yet, try it with a somewhat good guess
         -- Tries to get the first char of every word, does not go well with utf-8 chars
-        self.db.profile.instanceAbbr[instanceName] = string_gsub(instanceName, "(%a)[%l%p]*[%s%-]*", "%1")
+        instanceAbbr[instanceName] = (string_gsub(instanceName, "(%a)[%l%p]*[%s%-]*", "%1"))
     end
-    
-    return ( self.db.profile.instanceAbbr[instanceName] ~= "" and self.db.profile.instanceAbbr[instanceName] or nil )
+
+    return ( instanceAbbr[instanceName] ~= "" and instanceAbbr[instanceName] or nil )
 end
 
+-- Daily/weekly flags are stored as expire timestamps, or 'true' when
+-- the expire time is unknown (expires the next time the char logs in)
+local TIMED_FLAGS = { "dailyheroic", "dailypvp", "weeklydone", "wgvictory" }
+
 function Ailo:GetNextPurge()
-    local charsdb = self.db.global.chars
-    local realm, charscurrentPlayer, instances, currentInstance, expireTime
     local nextPurge = 0
-    for realm, chars in pairs(charsdb) do 
-        for currentPlayer, instances in pairs(chars) do 
+    local value
+    for realm, chars in pairs(self.db.global.chars) do
+        for currentPlayer, instances in pairs(chars) do
             if instances.lockouts then
                 for currentInstance, expireTime in pairs(instances.lockouts) do
                     if nextPurge == 0 or nextPurge > expireTime then
@@ -486,62 +547,88 @@ function Ailo:GetNextPurge()
                     end
                 end
             end
-            if instances.dailyheroic and ( nextPurge == 0 or nextPurge > instances.dailyheroic ) then 
-                nextPurge = instances.dailyheroic
+            for _, flag in ipairs(TIMED_FLAGS) do
+                value = instances[flag]
+                if type(value) == "number" and ( nextPurge == 0 or nextPurge > value ) then
+                    nextPurge = value
+                end
             end
         end
     end
     return nextPurge
 end
 
-function Ailo:PurgeOldRaidIDs()
-    local charsdb = self.db.global.chars
-    local realm, currentPlayer, instances, currentInstance, expireTime
+function Ailo:UpdateNextPurge(expireTime)
+    if expireTime < self.db.global.nextPurge or self.db.global.nextPurge == 0 then
+        self.db.global.nextPurge = expireTime
+    end
+end
+
+-- Removes expired lockouts and daily/weekly flags, then recalculates the next purge
+function Ailo:PurgeExpired()
     local now = time()
-    for realm, chars in pairs(charsdb) do 
-        for currentPlayer, instances in pairs(chars) do 
-            if instances.lockouts then 
+    local value
+    for realm, chars in pairs(self.db.global.chars) do
+        for currentPlayer, instances in pairs(chars) do
+            if instances.lockouts then
                 for currentInstance, expireTime in pairs(instances.lockouts) do
                     if now > expireTime then
-                        self.db.global.chars[realm][currentPlayer].lockouts[currentInstance] = nil
+                        instances.lockouts[currentInstance] = nil
                     end
                 end
-                if not next(charsdb[realm][currentPlayer].lockouts) then 
-                    self.db.global.chars[realm][currentPlayer].lockouts = nil
+                if not next(instances.lockouts) then
+                    instances.lockouts = nil
+                end
+            end
+            for _, flag in ipairs(TIMED_FLAGS) do
+                value = instances[flag]
+                if type(value) == "number" and now > value then
+                    instances[flag] = nil
                 end
             end
         end
     end
+    self:TrimRaidTable()
+    self.db.global.nextPurge = self:GetNextPurge()
+end
+
+-- Kept for compatibility with external callers
+function Ailo:PurgeOldRaidIDs()
+    self:PurgeExpired()
+end
+
+function Ailo:CheckDailyHeroicLockouts()
+    self:PurgeExpired()
 end
 
 function Ailo:ExtendRaidTable(instanceName, size, difficulty)
     -- Save it for the tooltip
-    self.db.global.raids[instanceName] = self.db.global.raids[instanceName] or {}
-    self.db.global.raids[instanceName][size] =  self.db.global.raids[instanceName][size] or {}
-    self.db.global.raids[instanceName][size][difficulty] = true
-    
+    local raids = self.db.global.raids
+    raids[instanceName] = raids[instanceName] or {}
+    raids[instanceName][size] = raids[instanceName][size] or {}
+    raids[instanceName][size][difficulty] = true
 end
 
 function Ailo:TrimRaidTable()
     local charsdb = self.db.global.chars
     local raidsdb = self.db.global.raids
-    local currentPlayer, raids, currentInstance
-    local raid, sizes, size, difficulties, difficulty, realm, chars, currentPlayer, instances
-    local isUsed, raidString = false
+
+    -- Collect every lockout still in use once, instead of scanning all chars per raid
+    local used = {}
+    for realm, chars in pairs(charsdb) do
+        for currentPlayer, instances in pairs(chars) do
+            if instances.lockouts then
+                for raidString in pairs(instances.lockouts) do
+                    used[raidString] = true
+                end
+            end
+        end
+    end
+
     for raid, sizes in pairs(raidsdb) do
         for size, difficulties in pairs(sizes) do
-            for difficulty, _ in pairs(difficulties) do
-                isUsed = false
-                raidString = string_format("%s.%d.%s", raid, size, difficulty)
-                for realm, chars in pairs(charsdb) do 
-                    for currentPlayer,instances in pairs(chars) do
-                        if instances.lockouts and instances.lockouts[raidString] then
-                            isUsed = true
-                            break
-                        end
-                    end
-                end
-                if not isUsed then
+            for difficulty in pairs(difficulties) do
+                if not used[string_format("%s.%d.%s", raid, size, difficulty)] then
                     self:DeleteFromRaidTable(raid, size, difficulty)
                 end
             end
@@ -550,84 +637,122 @@ function Ailo:TrimRaidTable()
 end
 
 function Ailo:DeleteFromRaidTable(instanceName, size, difficulty)
-    self.db.global.raids[instanceName][size][difficulty] = nil
-    if not next(self.db.global.raids[instanceName][size]) then
-        self.db.global.raids[instanceName][size] = nil
+    local raids = self.db.global.raids
+    raids[instanceName][size][difficulty] = nil
+    if not next(raids[instanceName][size]) then
+        raids[instanceName][size] = nil
     end
-    if not next(self.db.global.raids[instanceName]) then
-        self.db.global.raids[instanceName] = nil
+    if not next(raids[instanceName]) then
+        raids[instanceName] = nil
     end
 end
 
 function Ailo:ManualPlayerUpdate()
     if currentMaxLevel > UnitLevel("player") then return end
     self:Output(L["Updating data for current player."])
-    if not self.db.global.chars[currentRealm] then 
-        self.db.global.chars[currentRealm] = {}
-    else
-        wipe(self.db.global.chars[currentRealm][currentChar])
-        self.db.global.chars[currentRealm][currentChar] = nil
+    local realmdb = self.db.global.chars[currentRealm]
+    if realmdb and realmdb[currentChar] then
+        wipe(realmdb[currentChar])
+        realmdb[currentChar] = nil
     end
 
     self:TrimRaidTable()
+    lastQuestQuery = 0 -- don't throttle a manual update
+    -- Ask the server for fresh data, UPDATE_INSTANCE_INFO will call UpdatePlayer()
+    RequestRaidInfo()
     self:UpdatePlayer()
 end
 
-function Ailo:SaveRaidForChar(instance, expireTime, character, realm)
+function Ailo:GetCharDB(character, realm)
     character = character or currentChar
     realm = realm or currentRealm
-    if not self.db.global.chars[realm] then
-        self.db.global.chars[realm] = {}
+    local chars = self.db.global.chars
+    if not chars[realm] then
+        chars[realm] = {}
     end
-    if not self.db.global.chars[realm][character] then
-        self.db.global.chars[realm][character] = {}
+    if not chars[realm][character] then
+        chars[realm][character] = {}
     end
-    if not self.db.global.chars[realm][character].lockouts then
-        self.db.global.chars[realm][character].lockouts = {}
+    return chars[realm][character]
+end
+
+function Ailo:SaveRaidForChar(instance, expireTime, character, realm)
+    local chardb = self:GetCharDB(character, realm)
+    if not chardb.lockouts then
+        chardb.lockouts = {}
     end
 
-    self.db.global.chars[realm][character].lockouts[instance] = expireTime
-    
-    if expireTime < self.db.global.nextPurge or self.db.global.nextPurge == 0 then
-        self.db.global.nextPurge = expireTime
-    end
+    chardb.lockouts[instance] = expireTime
+    self:UpdateNextPurge(expireTime)
 end
 
 function Ailo:WipeDB()
-    if type(self.db.global.chars) == "table" then 
+    if type(self.db.global.chars) == "table" then
         wipe(self.db.global.chars)
     end
-    if type(self.db.global.raids) == "table" then 
+    if type(self.db.global.raids) == "table" then
         wipe(self.db.global.raids)
     end
-    if type(self.db.global.charClass) == "table" then 
+    if type(self.db.global.charClass) == "table" then
         wipe(self.db.global.charClass)
+    end
+    self.db.global.nextPurge = 0
+end
+
+-- Returns the next weekly reset for the current realm, or nil if unknown.
+-- The reset time is learned from raid lockouts, which all expire at the weekly reset
+-- (except the 3-day ones like ZA/ZG/AQ20, which are filtered out).
+function Ailo:GetWeeklyReset()
+    local weeklyReset = self.db.global.weeklyReset
+    local reset = weeklyReset[currentRealm]
+    if not reset then return nil end
+    local now = time()
+    while reset <= now do
+        reset = reset + ONE_WEEK
+    end
+    weeklyReset[currentRealm] = reset
+    return reset
+end
+
+function Ailo:LearnWeeklyReset(secondsLeft, maxPlayers, difficulty)
+    -- 25/40-man and heroic raids are always weekly, anything over 3 days must be weekly too
+    if maxPlayers == 25 or maxPlayers == 40 or difficulty > 1 or secondsLeft > 3*24*60*60 then
+        self.db.global.weeklyReset[currentRealm] = time() + secondsLeft
     end
 end
 
 function Ailo:UpdatePlayer()
     if currentMaxLevel > UnitLevel("player") then return end
     self.db.global.charClass[currentCharRealm] = select(2,UnitClass('player'))
-    local now, index = time()
-    local instanceReset, instanceDifficulty, locked, isRaid, maxPlayers
-    local instanceNameAbbr, instanceString
+    local now = time()
+    local chardb = self:GetCharDB()
+
+    -- The server data is authoritative, rebuild this char's lockouts from it so
+    -- lockouts that ended early (or were reset) don't stick around
+    chardb.lockouts = nil
+
+    local _, instanceName, instanceReset, instanceDifficulty, locked, isRaid, maxPlayers
     for index=1,GetNumSavedInstances() do
-        instanceName, _, instanceReset, instanceDifficulty, locked, _, _, isRaid, maxPlayers, _ = GetSavedInstanceInfo(index)
-        if locked then
-            instanceString   = string_format("%s.%d.%s", instanceName, maxPlayers, instanceDifficulty)
+        instanceName, _, instanceReset, instanceDifficulty, locked, _, _, isRaid, maxPlayers = GetSavedInstanceInfo(index)
+        if locked and instanceName then
             self:ExtendRaidTable(instanceName, maxPlayers, instanceDifficulty)
-            self:SaveRaidForChar(instanceString, now+instanceReset)
+            self:SaveRaidForChar(string_format("%s.%d.%s", instanceName, maxPlayers, instanceDifficulty), now+instanceReset)
+            if isRaid then
+                self:LearnWeeklyReset(instanceReset, maxPlayers, instanceDifficulty)
+            end
         end
     end
+    self:TrimRaidTable()
     self:UpdateDailyHeroicForChar()
-    
-    -- Daily
-    self.db.global.chars[currentRealm][currentChar].dailypvp = nil
-    self.db.global.chars[currentRealm][currentChar].dailypvp = (GetRandomBGHonorCurrencyBonuses())
+    self:UpdateDailyPVPForChar()
 
     -- Weekly Raid tracking!
     -- The quests from dalaran "<XY> Must Die!"
-    QueryQuestsCompleted()
+    -- QueryQuestsCompleted() is an expensive server request, so throttle it
+    if now - lastQuestQuery >= QUEST_QUERY_THROTTLE then
+        lastQuestQuery = now
+        QueryQuestsCompleted()
+    end
 end
 
 
@@ -636,35 +761,22 @@ function Ailo:UPDATE_INSTANCE_INFO()
     self:UpdatePlayer()
 end
 
+function Ailo:PLAYER_ENTERING_WORLD()
+    -- Fires after leaving a battleground, so the random BG win gets picked up
+    self:UpdateDailyPVPForChar()
+end
+
 local INSTANCE_SAVED = _G["INSTANCE_SAVED"]
 function Ailo:CHAT_MSG_SYSTEM(event, msg)
     -- You are now saved to this instances.
     -- Refresh RaidInfo
-    if tostring(msg) == INSTANCE_SAVED then
+    if msg == INSTANCE_SAVED then
         RequestRaidInfo()
     end
 end
 
-function Ailo:CheckDailyHeroicLockouts()
-    local charsdb = self.db.global.chars
-    local iterateRealm, iteratePlayer, instances, expireTime
-    local now = time()
-    for iterateRealm, _ in pairs(charsdb) do
-        for iteratePlayer, instances in pairs(charsdb[iterateRealm]) do 
-            if instances.dailyheroic and now > instances.dailyheroic then
-                self.db.global.chars[iterateRealm][iteratePlayer].dailyheroic = nil
-            end
-        end
-    end
-end
-
 function Ailo:UpdateDailyHeroicForChar()
-    if not self.db.global.chars[currentRealm] then
-        self.db.global.chars[currentRealm] = {}
-    end
-    if not self.db.global.chars[currentRealm][currentChar] then
-        self.db.global.chars[currentRealm][currentChar] = {}
-    end
+    local chardb = self:GetCharDB()
     --[[
     GetLFGDungeonRewards(type)
     first return value: true if it was already done in this "Daily Quests"-lockout, false else
@@ -672,32 +784,44 @@ function Ailo:UpdateDailyHeroicForChar()
     ]]--
     if (GetLFGDungeonRewards(262)) then
         local expireTime = time()+GetQuestResetTime()
-        self.db.global.chars[currentRealm][currentChar].dailyheroic = expireTime
-        if expireTime < self.db.global.nextPurge or self.db.global.nextPurge == 0 then
-            self.db.global.nextPurge = expireTime
-        end
+        chardb.dailyheroic = expireTime
+        self:UpdateNextPurge(expireTime)
     else
-        self.db.global.chars[currentRealm][currentChar].dailyheroic = nil
+        chardb.dailyheroic = nil
     end
-   
 end
+
+function Ailo:UpdateDailyPVPForChar()
+    if currentMaxLevel > UnitLevel("player") then return end
+    local chardb = self:GetCharDB()
+    -- First return value is true if the random battleground has already been won today
+    if (GetRandomBGHonorCurrencyBonuses()) then
+        local expireTime = time()+GetQuestResetTime()
+        chardb.dailypvp = expireTime
+        self:UpdateNextPurge(expireTime)
+    else
+        chardb.dailypvp = nil
+    end
+end
+
 local questscompleted = {}
 function Ailo:QUEST_QUERY_COMPLETE()
+    wipe(questscompleted)
     GetQuestsCompleted(questscompleted)
-    if not self.db.global.chars[currentRealm] then
-        self.db.global.chars[currentRealm] = {}
-    end
-    if not self.db.global.chars[currentRealm][currentChar] then
-        self.db.global.chars[currentRealm][currentChar] = {}
+    local chardb = self:GetCharDB()
+
+    local weeklyExpire = self:GetWeeklyReset() or true
+    if type(weeklyExpire) == "number" then
+        self:UpdateNextPurge(weeklyExpire)
     end
 
-    self.db.global.chars[currentRealm][currentChar].weeklydone = nil
-    self.db.global.chars[currentRealm][currentChar].wgvictory = nil
+    chardb.weeklydone = nil
+    chardb.wgvictory = nil
 
     --[[ 13181 and 13183 are horde and alliance versions
     of the Victory in Wintergrasp weekly quest ]]--
     if questscompleted[13181] or questscompleted[13183] then
-        self.db.global.chars[currentRealm][currentChar].wgvictory = true
+        chardb.wgvictory = weeklyExpire
     end
 
     --[[ ID's of all raid weekly quests:
@@ -706,10 +830,12 @@ function Ailo:QUEST_QUERY_COMPLETE()
     ]]--
     for i=24579,24590 do
         if questscompleted[i] then
-            self.db.global.chars[currentRealm][currentChar].weeklydone = true
-            return
+            chardb.weeklydone = weeklyExpire
+            break
         end
     end
+    -- The completed quest list holds thousands of entries, don't keep it around
+    wipe(questscompleted)
 end
 
 function Ailo:LFG_UPDATE_RANDOM_INFO()
@@ -727,4 +853,3 @@ function Ailo:LFG_COMPLETION_REWARD()
     ]]--
     RequestLFDPlayerLockInfo()
 end
-
